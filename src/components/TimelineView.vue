@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { ref, computed, reactive, watch, onMounted, onUnmounted } from 'vue';
 import type { ParsedAdoData, Task, WorkItemType } from '../types/ado';
+import { buildExportCsv, downloadCsv } from '../utils/exporter';
 
 const props = defineProps<{ data: ParsedAdoData }>();
 
 // ─── Layout constants ──────────────────────────────────────────────────────
-const LABEL_W   = 220; // px – developer name column
-const DAY_W     = 44;  // px – per calendar day
+const LABEL_W        = 220; // px – developer name column
+const UNSCHEDULED_W  = 160; // px – sticky "unscheduled" panel (between label and canvas)
+const DAY_W          = 44;  // px – per calendar day
 const ROW_H     = 42;  // px – per task row
 const MONTH_ROW = 22;  // px – top header row (month groups)
 const DAY_ROW   = 28;  // px – bottom header row (individual days)
@@ -179,8 +181,9 @@ interface LaneRow {
   color:   string;
 }
 interface Lane {
-  developer: string;
-  rows:      LaneRow[];
+  developer:   string;
+  datedRows:   LaneRow[]; // tasks with start/target dates → rendered in the canvas
+  undatedRows: LaneRow[]; // tasks with no dates → rendered in the sticky panel
 }
 
 const filteredTasks = computed(() =>
@@ -216,11 +219,15 @@ const lanes = computed((): Lane[] => {
   return allDevelopers.value
     .filter(dev => map.has(dev))
     .filter(dev => selectedDevs.value.size === 0 || selectedDevs.value.has(dev))
-    .map(developer => ({
-      developer,
-      // Always order rows by Work ID ascending.
-      rows: (map.get(developer) ?? []).sort((a, b) => a.task.id - b.task.id),
-    }));
+    .map(developer => {
+      // Always order rows by Work ID ascending, then split by date presence.
+      const all = (map.get(developer) ?? []).sort((a, b) => a.task.id - b.task.id);
+      return {
+        developer,
+        datedRows:   all.filter(r =>  r.hasDate),
+        undatedRows: all.filter(r => !r.hasDate),
+      };
+    });
 });
 
 // ─── Legend (one entry per User Story with tasks) ─────────────────────────
@@ -238,6 +245,12 @@ const legendItems = computed(() => {
   }
   return items;
 });
+
+// ─── Unscheduled column visibility ───────────────────────────────────────
+// Hide the sticky panel entirely when every task in the current view has dates
+// (avoids wasting horizontal space once everything is scheduled).
+const hasUndatedTasks = computed(() => lanes.value.some(l => l.undatedRows.length > 0));
+const unscheduledColW = computed(() => hasUndatedTasks.value ? UNSCHEDULED_W : 0);
 
 // ─── Date helpers ──────────────────────────────────────────────────────────
 function isWeekend(d: Date): boolean { const dow = d.getDay(); return dow === 0 || dow === 6; }
@@ -322,14 +335,16 @@ function registerCanvas(dev: string, el: Element | null) {
 }
 
 // Convert an absolute clientX to a 0-based day index within the timeline grid.
+// Returns null when the pointer is to the left of the canvas (over sticky panels).
 function dayIndexFromClientX(clientX: number): number | null {
   // Any lane canvas shares the same horizontal origin, so use the first one.
   const el = canvasEls.values().next().value as HTMLElement | undefined;
   if (!el) return null;
   const rect = el.getBoundingClientRect();
   const x = clientX - rect.left;
+  if (x < 0) return null; // still over a sticky column – no drop target yet
   const idx = Math.floor(x / DAY_W);
-  return Math.max(0, Math.min(idx, dayHeaders.value.length - 1));
+  return Math.min(idx, dayHeaders.value.length - 1);
 }
 
 // Default span (days) for a task that is being scheduled for the first time.
@@ -412,6 +427,79 @@ function addDays(iso: string, days: number): string {
   return new Date(ms).toISOString().split('T')[0];
 }
 
+// Advance an ISO date forward until it lands on a Monday–Friday.
+// Saturday (+1) and Sunday (+2) both yield the following Monday.
+//
+// NOTE: ISO "YYYY-MM-DD" strings are parsed by JavaScript as UTC midnight.
+// getUTCDay() must be used here so the day-of-week check matches the UTC
+// date rather than the local calendar day (which is one day behind in UTC−N
+// timezones and would cause the filter to fire on the wrong days).
+function nextBusinessDay(iso: string): string {
+  let ms = new Date(iso).getTime();
+  let dow = new Date(ms).getUTCDay(); // 0=Sun, 6=Sat  ← UTC, not local
+  while (dow === 0 || dow === 6) {
+    ms += MS_DAY;
+    dow = new Date(ms).getUTCDay();
+  }
+  return isoFromMs(ms);
+}
+
+// ─── Cascade mode (FR-3.3 / Rule 7.4) ────────────────────────────────────
+// When ON: after any date change, subsequent tasks for the same developer are
+// automatically shifted forward so no two tasks overlap on the same day.
+const cascadeMode = ref(false);
+
+/**
+ * Propagate a date change forward through the developer's task list.
+ *
+ * Rules:
+ *  • Only tasks that come AFTER `anchorTask` in ID-ascending order are
+ *    considered (same order as the visual rows).
+ *  • A task is shifted only when it would START on or before the end of the
+ *    preceding task (overlap).  Once a gap is found, propagation stops.
+ *  • Each shifted task's start is moved to nextBusinessDay(prevEnd + 1 day).
+ *    Its target is recalculated preserving `durationDays`, then also snapped
+ *    to a business day.
+ */
+function applyCascade(anchorTask: Task) {
+  if (!cascadeMode.value) return;
+
+  const dev = anchorTask.assignedToName || 'Unassigned';
+
+  // Dated tasks for this developer, sorted by ID ascending (matches display).
+  const devTasks = localTasks
+    .filter(t => (t.assignedToName || 'Unassigned') === dev && t.startDate != null)
+    .sort((a, b) => a.id - b.id);
+
+  const anchorIdx = devTasks.findIndex(t => t.id === anchorTask.id);
+  if (anchorIdx === -1) return;
+
+  // Walk tasks after the anchor, pushing each one forward as long as overlap.
+  let prevEnd = anchorTask.targetDate ?? anchorTask.startDate;
+
+  for (let i = anchorIdx + 1; i < devTasks.length; i++) {
+    const t = devTasks[i];
+    if (prevEnd == null || t.startDate == null) break;
+
+    // The earliest acceptable start for this task.
+    const minStart = nextBusinessDay(addDays(prevEnd, 1));
+
+    if (t.startDate < minStart) {
+      // Overlap detected → push this task.
+      t.startDate  = minStart;
+      t.targetDate = nextBusinessDay(addDays(minStart, Math.max(0, t.durationDays - 1)));
+      recomputeDuration(t);
+      growRangeFor(t.startDate);
+      growRangeFor(t.targetDate!);
+    } else {
+      // No overlap → cascade stops; remaining tasks are already clear.
+      break;
+    }
+
+    prevEnd = t.targetDate ?? t.startDate;
+  }
+}
+
 function onDragEnd() {
   const d = drag.value;
   window.removeEventListener('pointermove', onDragMove);
@@ -431,22 +519,23 @@ function onDragEnd() {
     if (d.isUndated) {
       // ── Schedule a previously undated task at the drop position ──
       if (d.dropDayIndex !== null) {
-        const startMs = timelineRange.value.start.getTime() + d.dropDayIndex * MS_DAY;
-        const newStart = isoFromMs(startMs);
-        task.startDate  = newStart;
-        task.targetDate = addDays(newStart, Math.max(0, d.durationDays - 1));
+        const rawStart  = isoFromMs(timelineRange.value.start.getTime() + d.dropDayIndex * MS_DAY);
+        task.startDate  = nextBusinessDay(rawStart);
+        task.targetDate = nextBusinessDay(addDays(task.startDate, Math.max(0, d.durationDays - 1)));
         recomputeDuration(task);
         growRangeFor(task.startDate);
         growRangeFor(task.targetDate!);
+        applyCascade(task);
       }
     } else if (d.dayDelta !== 0 && task.startDate) {
       // ── Horizontal reschedule (FR-3.1: preserve duration) ──
-      const newStart = addDays(task.startDate, d.dayDelta);
-      task.startDate = newStart;
-      task.targetDate = addDays(newStart, Math.max(0, d.durationDays - 1));
+      const rawStart  = addDays(task.startDate, d.dayDelta);
+      task.startDate  = nextBusinessDay(rawStart);
+      task.targetDate = nextBusinessDay(addDays(task.startDate, Math.max(0, d.durationDays - 1)));
       recomputeDuration(task);
-      growRangeFor(newStart);
+      growRangeFor(task.startDate);
       growRangeFor(task.targetDate!);
+      applyCascade(task);
     }
   } else if (d.mode === 'resize-start' && d.dayDelta !== 0 && d.origStartMs !== null) {
     // ── Resize from left edge: move ONLY the Start Date (FR-3.2) ──
@@ -454,10 +543,11 @@ function onDragEnd() {
     // Clamp so start never passes the target (minimum 1-day span).
     const endMs = d.origEndMs ?? d.origStartMs;
     if (newStartMs > endMs) newStartMs = endMs;
-    task.startDate = isoFromMs(newStartMs);
-    if (!task.targetDate) task.targetDate = isoFromMs(endMs);
+    task.startDate = nextBusinessDay(isoFromMs(newStartMs));
+    if (!task.targetDate) task.targetDate = nextBusinessDay(isoFromMs(endMs));
     recomputeDuration(task);
     growRangeFor(task.startDate);
+    applyCascade(task);
   } else if (d.mode === 'resize-end' && d.dayDelta !== 0) {
     // ── Resize from right edge: move ONLY the Target Date (FR-3.2) ──
     const baseEndMs = d.origEndMs ?? d.origStartMs;
@@ -466,10 +556,11 @@ function onDragEnd() {
     // Clamp so target never precedes the start (minimum 1-day span).
     const startMs = d.origStartMs ?? baseEndMs;
     if (newEndMs < startMs) newEndMs = startMs;
-    task.targetDate = isoFromMs(newEndMs);
-    if (!task.startDate) task.startDate = isoFromMs(startMs);
+    task.targetDate = nextBusinessDay(isoFromMs(newEndMs));
+    if (!task.startDate) task.startDate = nextBusinessDay(isoFromMs(startMs));
     recomputeDuration(task);
     growRangeFor(task.targetDate);
+    applyCascade(task);
   }
 }
 
@@ -604,6 +695,45 @@ onUnmounted(() => {
   window.removeEventListener('pointerup',   onDragEnd);
 });
 
+// ─── CSV export (FR-1.3) ──────────────────────────────────────────────────
+
+/**
+ * Number of tasks that will appear in the next export file.
+ * - When there are local edits: counts only modified rows (delta export).
+ * - When nothing was edited   : counts all tasks (full-state export).
+ */
+const exportRowCount = computed(() => {
+  // Quick-check: if nothing changed return total task count.
+  if (!hasLocalEdits.value) return localTasks.length;
+
+  const origMap = new Map<number, Task>();
+  for (const t of props.data.orphanTasks) origMap.set(t.id, t);
+  for (const epic of props.data.epics)
+    for (const us of epic.userStories)
+      for (const t of us.tasks) origMap.set(t.id, t);
+
+  return localTasks.filter(t => {
+    const o = origMap.get(t.id);
+    if (!o) return true;
+    return (
+      o.startDate                !== t.startDate              ||
+      o.targetDate               !== t.targetDate             ||
+      (o.assignedToName || '')   !== (t.assignedToName || '')
+    );
+  }).length;
+});
+
+async function triggerExport() {
+  const result   = buildExportCsv(localTasks, props.data);
+  const dateTag  = new Date().toISOString().split('T')[0];
+  const suffix   = result.isFullExport ? 'full' : 'delta';
+  const filename = `ado-export-${dateTag}-${suffix}.csv`;
+  await downloadCsv(result.csv, filename);
+}
+
+// Expose so App.vue header can call triggerExport via a template ref.
+defineExpose({ triggerExport, exportRowCount, hasLocalEdits });
+
 // ─── Type badge color ─────────────────────────────────────────────────────
 const TYPE_PILL: Record<string, string> = {
   Task:          'border-green-700 text-green-300',
@@ -692,6 +822,31 @@ function typePill(t: string, active: boolean): string {
         </button>
       </div>
 
+      <!-- Cascade mode toggle (FR-3.3 / Rule 7.4) -->
+      <button
+        type="button"
+        class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors"
+        :class="cascadeMode
+          ? 'border-emerald-600 bg-emerald-950/50 text-emerald-300'
+          : 'border-zinc-700 bg-zinc-800 text-zinc-400 hover:border-zinc-500 hover:text-zinc-300'"
+        :title="cascadeMode
+          ? 'Cascade ON — subsequent tasks shift automatically to prevent overlaps'
+          : 'Cascade OFF — click to enable automatic task shifting'"
+        @click="cascadeMode = !cascadeMode"
+      >
+        <!-- chain-link icon -->
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round"
+            d="M13.19 8.688a4.5 4.5 0 011.242 7.244l-4.5 4.5a4.5 4.5 0 01-6.364-6.364l1.757-1.757m13.35-.622l1.757-1.757a4.5 4.5 0 00-6.364-6.364l-4.5 4.5a4.5 4.5 0 001.242 7.244" />
+        </svg>
+        Cascade
+        <!-- status dot -->
+        <span
+          class="w-1.5 h-1.5 rounded-full"
+          :class="cascadeMode ? 'bg-emerald-400' : 'bg-zinc-600'"
+        />
+      </button>
+
       <!-- Clear all filters -->
       <button
         v-if="selectedDevs.size || selectedTypes.size"
@@ -717,6 +872,30 @@ function typePill(t: string, active: boolean): string {
           <path stroke-linecap="round" stroke-linejoin="round" d="M9 15L3 9m0 0l6-6M3 9h12a6 6 0 010 12h-3" />
         </svg>
         Reset changes
+      </button>
+
+      <!-- Export CSV (FR-1.3) -->
+      <button
+        type="button"
+        class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors"
+        :class="hasLocalEdits
+          ? 'border-teal-600 bg-teal-950/50 text-teal-300 hover:bg-teal-900/60'
+          : 'border-zinc-700 bg-zinc-800 text-zinc-400 hover:border-zinc-500 hover:text-zinc-300'"
+        :title="hasLocalEdits
+          ? `Export ${exportRowCount} modified task${exportRowCount !== 1 ? 's' : ''} to CSV`
+          : 'Export all tasks to CSV (no changes yet)'"
+        @click="triggerExport"
+      >
+        <!-- download icon -->
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+        </svg>
+        Export CSV
+        <!-- change count badge -->
+        <span
+          v-if="hasLocalEdits"
+          class="px-1.5 rounded-full text-[10px] font-bold text-white bg-teal-600"
+        >{{ exportRowCount }}</span>
       </button>
 
       <!-- Stats pill -->
@@ -760,7 +939,7 @@ function typePill(t: string, active: boolean): string {
       style="scrollbar-color: #3f3f46 transparent;"
     >
       <!-- Content wider than viewport → enables horizontal scroll in this container -->
-      <div :style="{ minWidth: (LABEL_W + timelineWidth) + 'px' }">
+      <div :style="{ minWidth: (LABEL_W + unscheduledColW + timelineWidth) + 'px' }">
 
         <!-- ── Sticky header ─────────────────────────────────────────── -->
         <div
@@ -773,6 +952,15 @@ function typePill(t: string, active: boolean): string {
             :style="{ width: LABEL_W + 'px', minWidth: LABEL_W + 'px', flexShrink: 0 }"
           >
             <span class="text-[10px] text-zinc-600 uppercase tracking-wider font-medium">Developer</span>
+          </div>
+
+          <!-- Unscheduled column header (sticky; only rendered when there are undated tasks) -->
+          <div
+            v-if="hasUndatedTasks"
+            class="sticky z-20 bg-zinc-900 border-r border-zinc-700/60 flex items-end px-2 pb-1.5"
+            :style="{ left: LABEL_W + 'px', width: UNSCHEDULED_W + 'px', minWidth: UNSCHEDULED_W + 'px', flexShrink: 0 }"
+          >
+            <span class="text-[10px] text-zinc-600 uppercase tracking-wider font-medium">Unscheduled</span>
           </div>
 
           <!-- Date header columns -->
@@ -815,7 +1003,7 @@ function typePill(t: string, active: boolean): string {
           :class="drag && drag.moved && drag.targetDev === lane.developer && drag.origDev !== lane.developer
             ? 'bg-blue-950/30 ring-1 ring-inset ring-blue-500/40'
             : ''"
-          :style="{ minHeight: Math.max(1, lane.rows.length) * ROW_H + 'px' }"
+          :style="{ minHeight: Math.max(1, Math.max(lane.datedRows.length, lane.undatedRows.length)) * ROW_H + 'px' }"
         >
 
           <!-- Sticky developer name cell -->
@@ -832,8 +1020,55 @@ function typePill(t: string, active: boolean): string {
               :title="lane.developer"
             >{{ lane.developer }}</span>
             <span class="text-[10px] text-zinc-600">
-              {{ lane.rows.length }} task{{ lane.rows.length !== 1 ? 's' : '' }}
+              {{ lane.datedRows.length + lane.undatedRows.length }} task{{ (lane.datedRows.length + lane.undatedRows.length) !== 1 ? 's' : '' }}
             </span>
+          </div>
+
+          <!-- ── Sticky unscheduled panel ──────────────────────────────── -->
+          <!-- Chips are always visible; the user drags them right to schedule -->
+          <div
+            v-if="hasUndatedTasks"
+            class="sticky z-10 border-r border-zinc-700/60 bg-zinc-950 flex flex-col justify-start py-1 gap-0.5 overflow-y-auto"
+            :style="{ left: LABEL_W + 'px', width: UNSCHEDULED_W + 'px', minWidth: UNSCHEDULED_W + 'px', flexShrink: 0 }"
+            style="scrollbar-width: none;"
+          >
+            <div
+              v-for="row in lane.undatedRows"
+              :key="row.task.id"
+              class="mx-1 touch-none cursor-grab group/chip flex items-center rounded overflow-hidden"
+              :class="isDragging(row.task.id) ? 'opacity-30 cursor-grabbing' : 'hover:brightness-110'"
+              :style="{
+                height: (ROW_H - 14) + 'px',
+                backgroundColor: row.color + '18',
+                border: `1px dashed ${row.color}40`,
+              }"
+              @pointerdown="beginDrag(row, $event, 'move')"
+              @mouseenter="!drag && showTooltip(row, $event)"
+              @mouseleave="hideTooltip"
+            >
+              <!-- Left color accent -->
+              <div class="w-[3px] self-stretch rounded-l shrink-0" :style="{ backgroundColor: row.color + '80' }" />
+              <!-- Title -->
+              <span class="mx-1.5 text-[11px] font-medium text-zinc-400 truncate flex-1 pointer-events-none select-none">
+                {{ row.task.title }}
+              </span>
+              <!-- Drag hint icon -->
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                class="w-3 h-3 shrink-0 mr-1.5 text-zinc-600 group-hover/chip:text-blue-400 transition-colors pointer-events-none"
+                fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"
+              >
+                <path stroke-linecap="round" stroke-linejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
+              </svg>
+            </div>
+            <!-- Empty placeholder so the drop zone always shows something -->
+            <div
+              v-if="lane.undatedRows.length === 0"
+              class="mx-1 flex items-center justify-center rounded"
+              :style="{ height: (ROW_H - 14) + 'px' }"
+            >
+              <span class="text-[10px] text-zinc-700 italic">—</span>
+            </div>
           </div>
 
           <!-- Task bar canvas -->
@@ -841,7 +1076,7 @@ function typePill(t: string, active: boolean): string {
             :ref="(el) => registerCanvas(lane.developer, el as Element | null)"
             :style="{
               width: timelineWidth + 'px',
-              height: Math.max(1, lane.rows.length) * ROW_H + 'px',
+              height: Math.max(1, Math.max(lane.datedRows.length, lane.undatedRows.length)) * ROW_H + 'px',
               flexShrink: 0,
             }"
             class="relative overflow-hidden"
@@ -871,9 +1106,9 @@ function typePill(t: string, active: boolean): string {
               :style="{ left: todayOffset + 'px' }"
             />
 
-            <!-- Task bars -->
+            <!-- Task bars (dated tasks only; undated tasks are in the sticky panel) -->
             <div
-              v-for="(row, ri) in lane.rows"
+              v-for="(row, ri) in lane.datedRows"
               :key="row.task.id"
               class="absolute touch-none group/bar"
               :class="[
@@ -954,6 +1189,31 @@ function typePill(t: string, active: boolean): string {
                 </div>
               </template>
             </div>
+
+            <!-- Ghost bar: shows where the undated task will land while dragging -->
+            <div
+              v-if="drag?.isUndated && drag.moved && drag.dropDayIndex !== null
+                    && (drag.targetDev ?? drag.origDev) === lane.developer"
+              class="absolute pointer-events-none z-40 rounded"
+              :style="{
+                top:    (lane.datedRows.filter(r => r.task.id < drag!.taskId).length * ROW_H + 7) + 'px',
+                left:   (drag.dropDayIndex * DAY_W) + 'px',
+                width:  Math.max(DAY_W - 3, drag.durationDays * DAY_W - 3) + 'px',
+                height: (ROW_H - 14) + 'px',
+              }"
+            >
+              <div
+                class="w-full h-full rounded flex items-center px-2 gap-1.5 overflow-hidden"
+                style="background: rgb(37 99 235 / 0.18); border: 1px dashed rgb(96 165 250 / 0.7);"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3 text-blue-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M6.75 3v2.25M17.25 3v2.25M3 18.75V7.5a2.25 2.25 0 012.25-2.25h13.5A2.25 2.25 0 0121 7.5v11.25m-18 0A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75m-18 0v-7.5A2.25 2.25 0 015.25 9h13.5A2.25 2.25 0 0121 9v7.5" />
+                </svg>
+                <span class="text-[11px] font-medium text-blue-300 truncate pointer-events-none select-none">
+                  {{ findTask(drag!.taskId)?.title }}
+                </span>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1022,6 +1282,7 @@ function typePill(t: string, active: boolean): string {
             <p v-if="tooltip.task.originalEstimate !== null" class="text-[11px] text-zinc-400">
               <span class="text-zinc-600">Original Estimate: </span>
               <span class="text-sky-400 font-medium">{{ tooltip.task.originalEstimate }}h</span>
+              <span class="text-zinc-500 font-medium"> ({{ Math.ceil(tooltip.task.originalEstimate! / 8) }}d)</span>
             </p>
           </div>
         </div>

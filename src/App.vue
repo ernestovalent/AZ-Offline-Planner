@@ -6,6 +6,9 @@ import TimelineView from './components/TimelineView.vue';
 import { parseAdoFile } from './utils/parser';
 import type { ParsedAdoData } from './types/ado';
 
+// Template ref to access the exposed export API of TimelineView.
+const timelineRef = ref<InstanceType<typeof TimelineView> | null>(null);
+
 type AppState = 'idle' | 'loading' | 'preview' | 'timeline' | 'error';
 
 const appState       = ref<AppState>('idle');
@@ -100,6 +103,29 @@ const mainScrollable = computed(() => appState.value !== 'timeline');
           </svg>
         </button>
 
+        <!-- Export CSV (when on timeline) -->
+        <button
+          v-if="appState === 'timeline'"
+          type="button"
+          class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors"
+          :class="timelineRef?.hasLocalEdits
+            ? 'text-white bg-teal-600 hover:bg-teal-500 border-teal-500'
+            : 'text-zinc-300 bg-zinc-800 hover:bg-zinc-700 border-zinc-700'"
+          :title="timelineRef?.hasLocalEdits
+            ? 'Download CSV with modified tasks for ADO bulk import'
+            : 'Download CSV with all tasks (no changes yet)'"
+          @click="timelineRef?.triggerExport()"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+          </svg>
+          Export CSV
+          <span
+            v-if="timelineRef?.hasLocalEdits && timelineRef?.exportRowCount"
+            class="px-1.5 rounded-full text-[10px] font-bold bg-white/20"
+          >{{ timelineRef.exportRowCount }}</span>
+        </button>
+
         <!-- Import new file (when not idle) -->
         <button
           v-if="appState !== 'idle'"
@@ -185,6 +211,7 @@ const mainScrollable = computed(() => appState.value !== 'timeline');
       <!-- Timeline -->
       <TimelineView
         v-else-if="appState === 'timeline' && parsedData"
+        ref="timelineRef"
         :data="parsedData"
         class="flex-1 min-h-0"
       />

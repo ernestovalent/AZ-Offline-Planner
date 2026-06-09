@@ -1,0 +1,37 @@
+ID,Work Item Type,Title 1,Title 2,Title 3,Assigned To,State,Start Date,Target Date,Original Estimate
+"136178","Epic","CVN-PRY-2026Q1-31 | Pantalla de Reservas (PUA) MDC",,,"OMAR AGUSTIN WORBIS BADIAS <oworbis@hotelxcaret.com>","Análisis","5/29/2026 12:00:00 AM",,
+"127142","User Story",,"1 Análisis y seguimiento de actividades",,"ISRAEL ALEJANDRO PARTIDA AVILA <ipartidaa@xcaret.com>","En construcción","5/29/2026 12:00:00 AM",,
+"136377","Task",,,"Actualizacion de HU y Tareas","MARTIN FRANCO NIEVES <mfrancon@xcaret.com>","Active","6/4/2026 8:28:00 AM","6/5/2026 12:00:00 AM","4"
+"136192","Task",,,"Analisis de documentacion de operacion reservaciones de socios MDC","MARTIN FRANCO NIEVES <mfrancon@xcaret.com>","Active","6/3/2026 8:15:00 AM","6/5/2026 12:00:00 AM","8"
+"135915","Task",,,"Documentacion del proceso","MARTIN FRANCO NIEVES <mfrancon@xcaret.com>","Active","5/27/2026 12:00:00 AM","6/5/2026 12:00:00 AM","12"
+"136677","User Story",,"2 Pase entre ambientes",,"OMAR AGUSTIN WORBIS BADIAS <oworbis@hotelxcaret.com>","New",,,
+"124942","Task",,,"Dev Demo y Entrega funcional QA","ERNESTO VALENTIN CAAMAL PEECH <ecaamal@xcaret.com>","New",,,"4"
+"124946","Task",,,"Dev Deploy a FC","ERNESTO VALENTIN CAAMAL PEECH <ecaamal@xcaret.com>","New","6/9/2026 12:00:00 AM","6/9/2026 12:00:00 AM","4"
+"136901","Task",,,"Dev Deploy a PC","ERNESTO VALENTIN CAAMAL PEECH <ecaamal@xcaret.com>","New",,,
+"124952","Task",,,"Dev Deploy a Producción","ERNESTO VALENTIN CAAMAL PEECH <ecaamal@xcaret.com>","New",,,"4"
+"124951","Task",,,"Dev Deploy a Produccion - Levantar CAB","ERNESTO VALENTIN CAAMAL PEECH <ecaamal@xcaret.com>","New",,,"4"
+"130315","Task",,,"QA / Actualización de matriz de pruebas","ADRIAN RIOS MONTIEL <ariosm@xcaret.com>","Active","5/19/2026 12:24:00 PM","5/22/2026 11:41:00 AM","8"
+"124945","Task",,,"QA Pruebas de no afectación progresivas (PC)","ADRIAN RIOS MONTIEL <ariosm@xcaret.com>","New",,,"16"
+"124948","Task",,,"QA Pruebas de no afectación regresivas (FC)","ADRIAN RIOS MONTIEL <ariosm@xcaret.com>","New",,,"8"
+"124944","Task",,,"QA Pruebas progresivas (PC)","ADRIAN RIOS MONTIEL <ariosm@xcaret.com>","Active","6/3/2026 12:19:00 PM","6/5/2026 12:00:00 AM","104"
+"124947","Task",,,"QA Pruebas regresivas (FC)","ADRIAN RIOS MONTIEL <ariosm@xcaret.com>","New",,,"80"
+"136671","User Story",,"BE2CCMDC 1 Acceso al Booking y reglas de membresía",,"OMAR AGUSTIN WORBIS BADIAS <oworbis@hotelxcaret.com>","New",,,
+"136960","Task",,,"Ajuste de plantilla de cotización en la platilla de correo","DAVID LEON LAGUNAS <dleon@mexicodestinationclub.com>","New",,,"4"
+"136958","Task",,,"Crear e integrar al Contacto para previsualización del comprador","ANGEL ANDRES ARANCIBIA GARCIA <aarancibia@mexicodestinationclub.com>","New",,,"20"
+"136248","Issue",,,"En la búsqueda, elegir primero el Hotel","ALFREDO JOSUE BOCHE HERRADA <aboche@mexicodestinationclub.com>","Active",,,
+"136968","Task",,,"Implementar filtrado de hoteles en el Booking Engine basado en las relaciones del Contrato Activo","ALFREDO JOSUE BOCHE HERRADA <aboche@mexicodestinationclub.com>","New",,,"18"
+"136972","Task",,,"Implementar validación de capacidad de pax en el BookingEngine","JULIO ARMANDO REYES IZQUIERDO <jreyesi@mexicodestinationclub.com>","New",,,"12"
+"136301","Task",,,"Modificar buscador para condicionar rango de edades y etiquetas según el tipo de hotel seleccionado","ALFREDO JOSUE BOCHE HERRADA <aboche@mexicodestinationclub.com>","Active","6/4/2026 12:00:00 AM","6/9/2026 12:00:00 AM","24"
+"136910","Task",,,"Validaciones de Contact Center MDC en Wrapper ""CC MDC""","CARLOS TOMAS GARCIA MARTINEZ <cgarciam@mexicodestinationclub.com>","New",,,"24"
+"135471","Task",,,"Validaciones de los nuevos Wrappers ""CC""","CARLOS TOMAS GARCIA MARTINEZ <cgarciam@mexicodestinationclub.com>","Active","6/3/2026 9:09:00 AM","6/5/2026 12:00:00 AM","24"
+"136673","User Story",,"BE2CCMDC 2 Lógica avanzada de reservas para invitados",,"OMAR AGUSTIN WORBIS BADIAS <oworbis@hotelxcaret.com>","New",,,
+"136978","Task",,,"Función de validación para reservaciones de invitados 1 - mismo carrito de compras","ALFREDO JOSUE BOCHE HERRADA <aboche@mexicodestinationclub.com>","New",,,
+"136977","Task",,,"Función de validación para reservaciones de invitados 2 - con reservación previa en la implementación de ""CC MDC""","ALFREDO JOSUE BOCHE HERRADA <aboche@mexicodestinationclub.com>","New",,,"18"
+"136675","User Story",,"BE2CCMDC 3 Procesamiento de pagos y ciclo de vida de la reserva",,"OMAR AGUSTIN WORBIS BADIAS <oworbis@hotelxcaret.com>","New",,,
+"134735","Task",,,"Corregir precisión de decimales y agregar tolerancia en validación de Pagos en Cobro Virtual","CARLOS TOMAS GARCIA MARTINEZ <cgarciam@mexicodestinationclub.com>","Active","5/20/2026 1:00:00 AM","5/22/2026 1:00:00 AM","17"
+"132301","Task",,,"Mover la lógica de creación de registros a la consulta del Itinerary antes de confirmar los pagos","CARLOS TOMAS GARCIA MARTINEZ <cgarciam@mexicodestinationclub.com>","New",,,"52"
+"136303","Bug",,,"Nombre de etiqueta Confirmar correo electrónico","ERNESTO VALENTIN CAAMAL PEECH <ecaamal@xcaret.com>","New",,,
+"136674","User Story",,"BE2CCMDC 4 Trazabilidad e integración de campos",,"OMAR AGUSTIN WORBIS BADIAS <oworbis@hotelxcaret.com>","New",,,
+"136943","Task",,,"Implementar módulo de Logging centralizado en el ""Booking Engine""","CARLOS TOMAS GARCIA MARTINEZ <cgarciam@mexicodestinationclub.com>","New",,,"24"
+"136676","User Story",,"BE2CCMDC 5 Control de reservaciones pendientes y proceso de cancelación",,"OMAR AGUSTIN WORBIS BADIAS <oworbis@hotelxcaret.com>","New",,,
+"105519","Epic","Reingenieria de Booking Engine LWC hoteles CC MDC",,,"LUIS ANTONIO MONROY ALARCON <lmonroy@xcaret.com>","En construcción","10/20/2025 12:00:00 AM","6/30/2026 12:00:00 AM",

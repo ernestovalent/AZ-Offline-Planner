@@ -12,9 +12,9 @@
   "app": {
     "windows": [
       {
-        "title": "azure-offline-planner",
-        "width": 800,
-        "height": 600
+        "title": "Azure Offline Planner by Valentin",
+        "width": 1200,
+        "height": 800
       }
     ],
     "security": {

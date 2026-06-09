@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { ref, computed, reactive, watch, onMounted, onUnmounted } from 'vue';
 import type { ParsedAdoData, Task, WorkItemType } from '../types/ado';
 
 const props = defineProps<{ data: ParsedAdoData }>();
@@ -11,6 +11,12 @@ const ROW_H     = 42;  // px – per task row
 const MONTH_ROW = 22;  // px – top header row (month groups)
 const DAY_ROW   = 28;  // px – bottom header row (individual days)
 const HEADER_H  = MONTH_ROW + DAY_ROW;
+const MS_DAY    = 86_400_000;
+
+// Forward buffer so there is always room to drag tasks into the future.
+// (Removes the previous short-term "+30 days" hard limit.)
+const FUTURE_DAYS = 180;
+const PAST_DAYS   = 14;
 
 // ─── Color palette (US → task bar color) ──────────────────────────────────
 const PALETTE = [
@@ -18,14 +24,32 @@ const PALETTE = [
   '#14b8a6', '#ef4444', '#6366f1', '#f97316', '#06b6d4',
 ];
 
-// ─── Derived flat task list ────────────────────────────────────────────────
-const allTasks = computed<Task[]>(() => {
-  const out: Task[] = [...props.data.orphanTasks];
-  for (const epic of props.data.epics)
+// ─── Local editable working copy ───────────────────────────────────────────
+// NFR/req-2: all edits live here only. props.data (and the source file) are
+// never mutated. We clone the flat task list and mutate startDate / targetDate
+// / assignedToName locally.
+const localTasks = reactive<Task[]>([]);
+
+function buildLocalTasks(data: ParsedAdoData): Task[] {
+  const out: Task[] = [];
+  for (const t of data.orphanTasks) out.push({ ...t });
+  for (const epic of data.epics)
     for (const us of epic.userStories)
-      out.push(...us.tasks);
+      for (const t of us.tasks) out.push({ ...t });
   return out;
-});
+}
+
+// (Re)hydrate the local store whenever a new file is imported.
+watch(
+  () => props.data,
+  (data) => {
+    localTasks.splice(0, localTasks.length, ...buildLocalTasks(data));
+  },
+  { immediate: true, deep: false }
+);
+
+// ─── Derived flat task list (reads the editable store) ─────────────────────
+const allTasks = computed<Task[]>(() => localTasks);
 
 // ─── Unique developer names (sorted; Unassigned last) ─────────────────────
 const allDevelopers = computed<string[]>(() => {
@@ -76,28 +100,37 @@ onMounted(() => document.addEventListener('mousedown', onDocClick));
 onUnmounted(() => document.removeEventListener('mousedown', onDocClick));
 
 // ─── Timeline date range ───────────────────────────────────────────────────
+// Extra days that get appended when a drag pushes a task past current bounds,
+// giving an effectively open-ended (indefinite) forward timeline.
+const extraEndDays   = ref(0);
+const extraStartDays = ref(0);
+
+function midnight(d: Date): Date { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
+
 const timelineRange = computed(() => {
   const ms: number[] = [];
   for (const t of allTasks.value) {
     if (t.startDate)  ms.push(new Date(t.startDate).getTime());
     if (t.targetDate) ms.push(new Date(t.targetDate).getTime());
   }
-  const PAD = 7 * 86_400_000;
-  if (!ms.length) {
-    const now = new Date(); now.setHours(0, 0, 0, 0);
-    return { start: new Date(now.getTime() - PAD), end: new Date(now.getTime() + 30 * 86_400_000) };
-  }
-  return {
-    start: new Date(Math.min(...ms) - PAD),
-    end:   new Date(Math.max(...ms) + PAD),
-  };
+  // Always include "today" so the timeline stays anchored to the present.
+  const today = midnight(new Date()).getTime();
+  ms.push(today);
+
+  const minMs = Math.min(...ms);
+  const maxMs = Math.max(...ms);
+
+  const start = new Date(minMs - (PAST_DAYS + extraStartDays.value) * MS_DAY);
+  // Long forward buffer removes the previous short-term future limit.
+  const end   = new Date(maxMs + (FUTURE_DAYS + extraEndDays.value) * MS_DAY);
+  return { start: midnight(start), end: midnight(end) };
 });
 
 const dayHeaders = computed<Date[]>(() => {
   const days: Date[] = [];
   const t0 = timelineRange.value.start.getTime();
-  const total = Math.ceil((timelineRange.value.end.getTime() - t0) / 86_400_000);
-  for (let i = 0; i < total; i++) days.push(new Date(t0 + i * 86_400_000));
+  const total = Math.ceil((timelineRange.value.end.getTime() - t0) / MS_DAY);
+  for (let i = 0; i < total; i++) days.push(new Date(t0 + i * MS_DAY));
   return days;
 });
 
@@ -170,9 +203,9 @@ const lanes = computed((): Lane[] => {
     const eMs    = task.targetDate ? new Date(task.targetDate).getTime() : null;
     const hasDate = sMs !== null;
 
-    const left      = hasDate ? Math.max(0, ((sMs! - t0) / 86_400_000) * DAY_W) : 0;
+    const left      = hasDate ? Math.max(0, ((sMs! - t0) / MS_DAY) * DAY_W) : 0;
     const daysSpan  = sMs !== null && eMs !== null
-      ? Math.max(1, (eMs - sMs) / 86_400_000 + 1)
+      ? Math.max(1, (eMs - sMs) / MS_DAY + 1)
       : Math.max(1, task.durationDays);
     const width = Math.max(DAY_W, daysSpan * DAY_W);
 
@@ -185,12 +218,8 @@ const lanes = computed((): Lane[] => {
     .filter(dev => selectedDevs.value.size === 0 || selectedDevs.value.has(dev))
     .map(developer => ({
       developer,
-      rows: (map.get(developer) ?? []).sort((a, b) => {
-        // Dated tasks first, then sort by start position
-        if (a.hasDate && !b.hasDate) return -1;
-        if (!a.hasDate && b.hasDate) return  1;
-        return a.left - b.left;
-      }),
+      // Always order rows by Work ID ascending.
+      rows: (map.get(developer) ?? []).sort((a, b) => a.task.id - b.task.id),
     }));
 });
 
@@ -253,6 +282,327 @@ function showTooltip(row: LaneRow, e: MouseEvent) {
 function hideTooltip() {
   tooltip.value = null;
 }
+
+// ─── Drag & drop (reschedule + reassign) ───────────────────────────────────
+const scrollRef = ref<HTMLElement | null>(null);
+
+type DragMode = 'move' | 'resize-start' | 'resize-end';
+
+interface DragState {
+  mode:          DragMode;
+  taskId:        number;
+  pointerId:     number;
+  startClientX:  number;
+  startClientY:  number;
+  origStartMs:   number | null;  // original task start (ms) or null if unscheduled
+  origEndMs:     number | null;  // original task target (ms) or null
+  durationDays:  number;         // preserved span (move mode)
+  dayDelta:      number;         // current horizontal shift in days
+  targetDev:     string | null;  // lane under the pointer (vertical reassign)
+  origDev:       string;
+  moved:         boolean;        // distinguishes a click from a drag
+  isUndated:     boolean;        // task had no dates → drag schedules it
+  dropDayIndex:  number | null;  // day column under the pointer (undated tasks)
+}
+const drag = ref<DragState | null>(null);
+
+// Lane DOM refs, registered per swimlane for vertical hit-testing.
+const laneEls = new Map<string, HTMLElement>();
+function registerLane(dev: string, el: Element | null) {
+  if (el) laneEls.set(dev, el as HTMLElement);
+  else    laneEls.delete(dev);
+}
+
+// Task-bar canvas DOM refs, used to map pointer X → timeline day index
+// (required to schedule undated tasks, which have no positional anchor).
+const canvasEls = new Map<string, HTMLElement>();
+function registerCanvas(dev: string, el: Element | null) {
+  if (el) canvasEls.set(dev, el as HTMLElement);
+  else    canvasEls.delete(dev);
+}
+
+// Convert an absolute clientX to a 0-based day index within the timeline grid.
+function dayIndexFromClientX(clientX: number): number | null {
+  // Any lane canvas shares the same horizontal origin, so use the first one.
+  const el = canvasEls.values().next().value as HTMLElement | undefined;
+  if (!el) return null;
+  const rect = el.getBoundingClientRect();
+  const x = clientX - rect.left;
+  const idx = Math.floor(x / DAY_W);
+  return Math.max(0, Math.min(idx, dayHeaders.value.length - 1));
+}
+
+// Default span (days) for a task that is being scheduled for the first time.
+function defaultSpanDays(task: Task): number {
+  if (task.durationDays && task.durationDays > 1) return task.durationDays;
+  // Derive a rough span from the Original Estimate (hours → 8h workdays).
+  if (task.originalEstimate && task.originalEstimate > 0) {
+    return Math.max(1, Math.ceil(task.originalEstimate / 8));
+  }
+  return 1;
+}
+
+function findTask(id: number): Task | undefined {
+  return localTasks.find(t => t.id === id);
+}
+
+function beginDrag(row: LaneRow, e: PointerEvent, mode: DragMode = 'move') {
+  // Only primary button initiates a drag.
+  if (e.button !== 0) return;
+  e.stopPropagation(); // resize handles must not also trigger a move drag
+  hideTooltip();
+  const task = row.task;
+  const origStartMs = task.startDate  ? new Date(task.startDate).getTime()  : null;
+  const origEndMs   = task.targetDate ? new Date(task.targetDate).getTime() : null;
+
+  const isUndated = origStartMs === null;
+
+  drag.value = {
+    mode,
+    taskId:       task.id,
+    pointerId:    e.pointerId,
+    startClientX: e.clientX,
+    startClientY: e.clientY,
+    origStartMs,
+    origEndMs,
+    durationDays: isUndated ? defaultSpanDays(task) : Math.max(1, task.durationDays),
+    dayDelta:     0,
+    targetDev:    null,
+    origDev:      task.assignedToName || 'Unassigned',
+    moved:        false,
+    isUndated,
+    dropDayIndex: null,
+  };
+
+  (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+  window.addEventListener('pointermove', onDragMove);
+  window.addEventListener('pointerup',   onDragEnd);
+}
+
+function laneUnderPointer(clientY: number): string | null {
+  for (const [dev, el] of laneEls) {
+    const r = el.getBoundingClientRect();
+    if (clientY >= r.top && clientY <= r.bottom) return dev;
+  }
+  return null;
+}
+
+function onDragMove(e: PointerEvent) {
+  const d = drag.value;
+  if (!d) return;
+
+  const dx = e.clientX - d.startClientX;
+  const dy = e.clientY - d.startClientY;
+  if (!d.moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) d.moved = true;
+
+  // Horizontal → whole-day delta
+  d.dayDelta = Math.round(dx / DAY_W);
+
+  // Undated task being scheduled → snap to the day column under the pointer.
+  if (d.isUndated && d.mode === 'move') {
+    d.dropDayIndex = dayIndexFromClientX(e.clientX);
+  }
+
+  // Vertical lane reassignment only applies when moving the whole bar.
+  d.targetDev = d.mode === 'move' ? laneUnderPointer(e.clientY) : null;
+}
+
+function addDays(iso: string, days: number): string {
+  const ms = new Date(iso).getTime() + days * MS_DAY;
+  return new Date(ms).toISOString().split('T')[0];
+}
+
+function onDragEnd() {
+  const d = drag.value;
+  window.removeEventListener('pointermove', onDragMove);
+  window.removeEventListener('pointerup',   onDragEnd);
+  drag.value = null;
+  if (!d || !d.moved) return;
+
+  const task = findTask(d.taskId);
+  if (!task) return;
+
+  if (d.mode === 'move') {
+    // ── Vertical reassignment (FR-3.4) ──
+    if (d.targetDev && d.targetDev !== d.origDev) {
+      task.assignedToName = d.targetDev === 'Unassigned' ? '' : d.targetDev;
+    }
+
+    if (d.isUndated) {
+      // ── Schedule a previously undated task at the drop position ──
+      if (d.dropDayIndex !== null) {
+        const startMs = timelineRange.value.start.getTime() + d.dropDayIndex * MS_DAY;
+        const newStart = isoFromMs(startMs);
+        task.startDate  = newStart;
+        task.targetDate = addDays(newStart, Math.max(0, d.durationDays - 1));
+        recomputeDuration(task);
+        growRangeFor(task.startDate);
+        growRangeFor(task.targetDate!);
+      }
+    } else if (d.dayDelta !== 0 && task.startDate) {
+      // ── Horizontal reschedule (FR-3.1: preserve duration) ──
+      const newStart = addDays(task.startDate, d.dayDelta);
+      task.startDate = newStart;
+      task.targetDate = addDays(newStart, Math.max(0, d.durationDays - 1));
+      recomputeDuration(task);
+      growRangeFor(newStart);
+      growRangeFor(task.targetDate!);
+    }
+  } else if (d.mode === 'resize-start' && d.dayDelta !== 0 && d.origStartMs !== null) {
+    // ── Resize from left edge: move ONLY the Start Date (FR-3.2) ──
+    let newStartMs = d.origStartMs + d.dayDelta * MS_DAY;
+    // Clamp so start never passes the target (minimum 1-day span).
+    const endMs = d.origEndMs ?? d.origStartMs;
+    if (newStartMs > endMs) newStartMs = endMs;
+    task.startDate = isoFromMs(newStartMs);
+    if (!task.targetDate) task.targetDate = isoFromMs(endMs);
+    recomputeDuration(task);
+    growRangeFor(task.startDate);
+  } else if (d.mode === 'resize-end' && d.dayDelta !== 0) {
+    // ── Resize from right edge: move ONLY the Target Date (FR-3.2) ──
+    const baseEndMs = d.origEndMs ?? d.origStartMs;
+    if (baseEndMs === null) return;
+    let newEndMs = baseEndMs + d.dayDelta * MS_DAY;
+    // Clamp so target never precedes the start (minimum 1-day span).
+    const startMs = d.origStartMs ?? baseEndMs;
+    if (newEndMs < startMs) newEndMs = startMs;
+    task.targetDate = isoFromMs(newEndMs);
+    if (!task.startDate) task.startDate = isoFromMs(startMs);
+    recomputeDuration(task);
+    growRangeFor(task.targetDate);
+  }
+}
+
+function isoFromMs(ms: number): string {
+  return new Date(ms).toISOString().split('T')[0];
+}
+
+// Keep durationDays in sync with the current start/target span.
+function recomputeDuration(task: Task) {
+  if (task.startDate && task.targetDate) {
+    const s = new Date(task.startDate).getTime();
+    const e = new Date(task.targetDate).getTime();
+    task.durationDays = Math.max(1, Math.round((e - s) / MS_DAY) + 1);
+  }
+}
+
+// Expand the visible range so a rescheduled task never gets clipped.
+function growRangeFor(iso: string) {
+  const ms = new Date(iso).getTime();
+  const startMs = timelineRange.value.start.getTime();
+  const endMs   = timelineRange.value.end.getTime();
+  if (ms < startMs) extraStartDays.value += Math.ceil((startMs - ms) / MS_DAY) + PAST_DAYS;
+  if (ms > endMs)   extraEndDays.value   += Math.ceil((ms - endMs)   / MS_DAY) + 14;
+}
+
+// Live preview offset (px) added to the bar's left during a drag.
+function dragOffsetX(taskId: number): number {
+  const d = drag.value;
+  if (!d || d.taskId !== taskId) return 0;
+  // Undated task: snap the bar to the day column under the pointer.
+  // (base `left` is 0, so the offset is the absolute drop position.)
+  if (d.mode === 'move' && d.isUndated) {
+    return d.dropDayIndex !== null ? d.dropDayIndex * DAY_W : 0;
+  }
+  // Whole-bar move and left-edge resize shift the left position;
+  // right-edge resize keeps the left fixed.
+  if (d.mode === 'move' || d.mode === 'resize-start') return d.dayDelta * DAY_W;
+  return 0;
+}
+
+// Live preview width delta (px) during a resize / undated scheduling.
+function dragWidthDelta(taskId: number, baseWidth: number): number {
+  const d = drag.value;
+  if (!d || d.taskId !== taskId) return 0;
+  if (d.mode === 'resize-end')   return d.dayDelta * DAY_W;   // grow/shrink right
+  if (d.mode === 'resize-start') return -d.dayDelta * DAY_W;  // left edge moves, width inverse
+  // Undated task: preview its full scheduled span while dragging.
+  if (d.mode === 'move' && d.isUndated && d.dropDayIndex !== null) {
+    return d.durationDays * DAY_W - baseWidth;
+  }
+  return 0;
+}
+
+function isDragging(taskId: number): boolean {
+  return drag.value?.taskId === taskId && drag.value.moved;
+}
+function isResizing(taskId: number): boolean {
+  const d = drag.value;
+  return !!d && d.taskId === taskId && d.moved && d.mode !== 'move';
+}
+
+// Human-readable preview of the in-progress drag (shown in the header).
+const dragPreview = computed(() => {
+  const d = drag.value;
+  if (!d || !d.moved) return null;
+  const task = findTask(d.taskId);
+  if (!task) return null;
+
+  const parts: string[] = [];
+
+  if (d.mode === 'move') {
+    if (d.isUndated) {
+      if (d.dropDayIndex !== null) {
+        const startMs = timelineRange.value.start.getTime() + d.dropDayIndex * MS_DAY;
+        const endIso  = isoFromMs(startMs + Math.max(0, d.durationDays - 1) * MS_DAY);
+        parts.push(`Schedule ${isoFromMs(startMs)} → ${endIso} (${d.durationDays}d)`);
+      } else {
+        parts.push('Drop on the timeline to schedule');
+      }
+    } else if (d.dayDelta !== 0 && d.origStartMs !== null) {
+      const newStart = isoFromMs(d.origStartMs + d.dayDelta * MS_DAY);
+      const sign = d.dayDelta > 0 ? '+' : '';
+      parts.push(`Start ${newStart} (${sign}${d.dayDelta}d)`);
+    }
+    if (d.targetDev && d.targetDev !== d.origDev) {
+      parts.push(`→ ${d.targetDev}`);
+    }
+  } else {
+    // Resize preview: compute clamped start/end and resulting duration.
+    let sMs = d.origStartMs;
+    let eMs = d.origEndMs ?? d.origStartMs;
+    if (d.mode === 'resize-start' && sMs !== null) {
+      sMs = Math.min(sMs + d.dayDelta * MS_DAY, eMs ?? sMs);
+    } else if (d.mode === 'resize-end' && eMs !== null) {
+      eMs = Math.max(eMs + d.dayDelta * MS_DAY, sMs ?? eMs);
+    }
+    if (sMs !== null && eMs !== null) {
+      const dur = Math.max(1, Math.round((eMs - sMs) / MS_DAY) + 1);
+      parts.push(`${isoFromMs(sMs)} → ${isoFromMs(eMs)}`);
+      parts.push(`(${dur}d)`);
+    }
+  }
+
+  return parts.length ? { title: task.title, info: parts.join('  ') } : null;
+});
+
+// ─── Local edit tracking + reset ───────────────────────────────────────────
+const hasLocalEdits = computed(() => {
+  const orig = new Map<number, Task>();
+  for (const t of props.data.orphanTasks) orig.set(t.id, t);
+  for (const epic of props.data.epics)
+    for (const us of epic.userStories)
+      for (const t of us.tasks) orig.set(t.id, t);
+
+  return localTasks.some(t => {
+    const o = orig.get(t.id);
+    if (!o) return false;
+    return o.startDate !== t.startDate
+      || o.targetDate !== t.targetDate
+      || (o.assignedToName || '') !== (t.assignedToName || '');
+  });
+});
+
+function resetEdits() {
+  localTasks.splice(0, localTasks.length, ...buildLocalTasks(props.data));
+  extraStartDays.value = 0;
+  extraEndDays.value   = 0;
+}
+
+onUnmounted(() => {
+  window.removeEventListener('pointermove', onDragMove);
+  window.removeEventListener('pointerup',   onDragEnd);
+});
 
 // ─── Type badge color ─────────────────────────────────────────────────────
 const TYPE_PILL: Record<string, string> = {
@@ -355,12 +705,38 @@ function typePill(t: string, active: boolean): string {
         Clear filters
       </button>
 
+      <!-- Reset local edits -->
+      <button
+        v-if="hasLocalEdits"
+        type="button"
+        class="ml-auto flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-amber-300 bg-amber-950/40 border border-amber-800/60 hover:bg-amber-900/50 transition-colors"
+        title="Discard all local date/assignment changes (source file is never modified)"
+        @click="resetEdits"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M9 15L3 9m0 0l6-6M3 9h12a6 6 0 010 12h-3" />
+        </svg>
+        Reset changes
+      </button>
+
       <!-- Stats pill -->
-      <div class="ml-auto flex items-center gap-3 text-xs text-zinc-500">
+      <div class="flex items-center gap-3 text-xs text-zinc-500" :class="hasLocalEdits ? 'ml-3' : 'ml-auto'">
         <span>{{ filteredTasks.length }} item{{ filteredTasks.length !== 1 ? 's' : '' }}</span>
         <span class="text-zinc-700">·</span>
         <span>{{ lanes.length }} developer{{ lanes.length !== 1 ? 's' : '' }}</span>
       </div>
+    </div>
+
+    <!-- ── Drag hint / live preview ─────────────────────────────────────── -->
+    <div
+      v-if="dragPreview"
+      class="flex items-center gap-2 px-4 py-1 bg-blue-950/50 border-b border-blue-900/50 text-xs shrink-0"
+    >
+      <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 text-blue-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" />
+      </svg>
+      <span class="text-zinc-300 font-medium truncate max-w-[40%]">{{ dragPreview.title }}</span>
+      <span class="text-blue-300 font-mono">{{ dragPreview.info }}</span>
     </div>
 
     <!-- ── Legend ──────────────────────────────────────────────────────── -->
@@ -377,7 +753,12 @@ function typePill(t: string, active: boolean): string {
     </div>
 
     <!-- ── Timeline ────────────────────────────────────────────────────── -->
-    <div class="flex-1 overflow-auto" style="scrollbar-color: #3f3f46 transparent;">
+    <div
+      ref="scrollRef"
+      class="flex-1 overflow-auto"
+      :class="drag ? 'select-none' : ''"
+      style="scrollbar-color: #3f3f46 transparent;"
+    >
       <!-- Content wider than viewport → enables horizontal scroll in this container -->
       <div :style="{ minWidth: (LABEL_W + timelineWidth) + 'px' }">
 
@@ -429,13 +810,20 @@ function typePill(t: string, active: boolean): string {
         <div
           v-for="lane in lanes"
           :key="lane.developer"
-          class="flex border-b border-zinc-800"
+          :ref="(el) => registerLane(lane.developer, el as Element | null)"
+          class="flex border-b border-zinc-800 transition-colors"
+          :class="drag && drag.moved && drag.targetDev === lane.developer && drag.origDev !== lane.developer
+            ? 'bg-blue-950/30 ring-1 ring-inset ring-blue-500/40'
+            : ''"
           :style="{ minHeight: Math.max(1, lane.rows.length) * ROW_H + 'px' }"
         >
 
           <!-- Sticky developer name cell -->
           <div
-            class="sticky left-0 z-10 bg-zinc-900 border-r border-zinc-700 px-3 py-2 flex flex-col justify-start gap-0.5"
+            class="sticky left-0 z-10 border-r border-zinc-700 px-3 py-2 flex flex-col justify-start gap-0.5 transition-colors"
+            :class="drag && drag.moved && drag.targetDev === lane.developer && drag.origDev !== lane.developer
+              ? 'bg-blue-950/60'
+              : 'bg-zinc-900'"
             :style="{ width: LABEL_W + 'px', minWidth: LABEL_W + 'px', flexShrink: 0 }"
           >
             <span
@@ -450,6 +838,7 @@ function typePill(t: string, active: boolean): string {
 
           <!-- Task bar canvas -->
           <div
+            :ref="(el) => registerCanvas(lane.developer, el as Element | null)"
             :style="{
               width: timelineWidth + 'px',
               height: Math.max(1, lane.rows.length) * ROW_H + 'px',
@@ -486,19 +875,26 @@ function typePill(t: string, active: boolean): string {
             <div
               v-for="(row, ri) in lane.rows"
               :key="row.task.id"
-              class="absolute cursor-default"
+              class="absolute touch-none group/bar"
+              :class="[
+                'cursor-grab',
+                isDragging(row.task.id) ? 'z-30 cursor-grabbing' : '',
+              ]"
               :style="{
                 top:    (ri * ROW_H + 7) + 'px',
-                left:   row.left + 'px',
-                width:  (row.width - 3) + 'px',
+                left:   (row.left + dragOffsetX(row.task.id)) + 'px',
+                width:  Math.max(DAY_W - 3, row.width - 3 + dragWidthDelta(row.task.id, row.width - 3)) + 'px',
                 height: (ROW_H - 14) + 'px',
+                transition: isDragging(row.task.id) ? 'none' : 'left 0.12s ease, width 0.12s ease',
               }"
-              @mouseenter="showTooltip(row, $event)"
+              @pointerdown="beginDrag(row, $event, 'move')"
+              @mouseenter="!drag && showTooltip(row, $event)"
               @mouseleave="hideTooltip"
             >
               <!-- Bar body -->
               <div
                 class="w-full h-full rounded flex items-center overflow-hidden relative"
+                :class="isDragging(row.task.id) ? 'shadow-lg shadow-black/50 ring-1 ring-white/20' : ''"
                 :style="{
                   backgroundColor: row.color + (row.hasDate ? '20' : '0c'),
                   border: `1px ${row.hasDate ? 'solid' : 'dashed'} ${row.color}${row.hasDate ? '70' : '35'}`,
@@ -506,22 +902,57 @@ function typePill(t: string, active: boolean): string {
               >
                 <!-- Left color accent -->
                 <div
-                  class="absolute left-0 top-0 bottom-0 w-[3px] rounded-l"
+                  class="absolute left-0 top-0 bottom-0 w-[3px] rounded-l pointer-events-none"
                   :style="{ backgroundColor: row.color + (row.hasDate ? '' : '60') }"
                 />
                 <!-- Task title -->
                 <span
-                  class="ml-2 pl-1 text-xs font-medium truncate flex-1"
+                  class="ml-2 pl-1 text-xs font-medium truncate flex-1 pointer-events-none"
                   :class="row.hasDate ? 'text-zinc-100' : 'text-zinc-500'"
                 >
                   {{ row.task.title }}
                 </span>
-                <!-- No-date badge -->
+                <!-- No-date badge → hints that dragging schedules the task -->
                 <span
                   v-if="!row.hasDate"
-                  class="shrink-0 mr-1.5 text-[9px] text-zinc-600 bg-zinc-800 border border-zinc-700 rounded px-1"
-                >No date</span>
+                  class="shrink-0 mr-1.5 text-[9px] rounded px-1 pointer-events-none flex items-center gap-0.5
+                         border transition-colors"
+                  :class="isDragging(row.task.id)
+                    ? 'text-blue-300 bg-blue-950/60 border-blue-700'
+                    : 'text-zinc-500 bg-zinc-800 border-zinc-700 group-hover/bar:text-blue-300 group-hover/bar:border-blue-700/60'"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" class="w-2 h-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 9h16.5m-16.5 6.75h16.5" />
+                  </svg>
+                  {{ isDragging(row.task.id) ? 'Scheduling…' : 'Drag to schedule' }}
+                </span>
               </div>
+
+              <!-- Resize handles (FR-3.2): only on dated tasks -->
+              <template v-if="row.hasDate">
+                <!-- Left edge → Start Date -->
+                <div
+                  class="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize flex items-center justify-center
+                         opacity-0 group-hover/bar:opacity-100 transition-opacity"
+                  :class="isResizing(row.task.id) ? 'opacity-100' : ''"
+                  title="Drag to change Start Date"
+                  @pointerdown="beginDrag(row, $event, 'resize-start')"
+                  @mouseenter="hideTooltip"
+                >
+                  <div class="h-3/5 w-[3px] rounded-full bg-white/70" />
+                </div>
+                <!-- Right edge → Target Date -->
+                <div
+                  class="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize flex items-center justify-center
+                         opacity-0 group-hover/bar:opacity-100 transition-opacity"
+                  :class="isResizing(row.task.id) ? 'opacity-100' : ''"
+                  title="Drag to change Target Date"
+                  @pointerdown="beginDrag(row, $event, 'resize-end')"
+                  @mouseenter="hideTooltip"
+                >
+                  <div class="h-3/5 w-[3px] rounded-full bg-white/70" />
+                </div>
+              </template>
             </div>
           </div>
         </div>
